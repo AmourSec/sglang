@@ -643,6 +643,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         index_page_size: Optional[int] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
+        index_dtype: Optional[torch.dtype] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
     ):
@@ -667,6 +668,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self.index_dtype = dtype if index_dtype is None else index_dtype
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )
@@ -707,6 +709,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
+        self.index_k_cache_quantized = self.index_dtype == torch.float8_e4m3fn
         self.index_page_size = page_size if index_page_size is None else index_page_size
         self.index_size = size if index_size is None else index_size
         parallel = get_parallel()
@@ -767,10 +770,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.index_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if self.index_k_cache_quantized and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
@@ -1087,11 +1090,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             "set_index_k_buffer (NPU MLA, raw virtual loc)",
         )
 
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
-
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+        if index_k.dtype != self.index_dtype:
+            index_k = index_k.to(self.index_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(

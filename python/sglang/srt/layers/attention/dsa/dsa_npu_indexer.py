@@ -235,7 +235,7 @@ class DSANPUIndexerMixin:
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+                k, pool.indexer_hadamard_128, pool.index_dtype
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
@@ -313,7 +313,7 @@ class DSANPUIndexerMixin:
                 query, query_scale = _quantize_npu_indexer_activation(
                     q.view(-1, self.n_heads, self.head_dim),
                     pool.indexer_hadamard_128,
-                    pool.dtype,
+                    pool.index_dtype,
                 )
                 topk_indices = torch_npu.npu_quant_lightning_indexer(
                     query=query,

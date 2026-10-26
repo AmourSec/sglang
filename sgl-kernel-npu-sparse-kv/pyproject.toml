@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgl-kernel-npu-sparse-kv"
+version = "0.1.0"
+description = "Standalone Ascend 950 sparse KV Plan/Transfer operators for SGLang"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0 AND BSD-3-Clause AND MulanPSL-2.0 AND LicenseRef-CANN-Open-Software-License-Agreement-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES/*.txt"]
+dependencies = [
+  "torch>=2.10,<2.11",
+  "torch-npu>=2.10,<2.11",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sgl_kernel_npu_sparse_kv = ["_cann_ops_custom/**/*"]

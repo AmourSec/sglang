@@ -2108,6 +2108,34 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
+        index_dtype = self.kv_cache_dtype
+        if is_dsa_model and is_arch35 and envs.SGLANG_NPU_SPARSE_KV_SIMT.get():
+            from sglang.srt.layers.quantization.modelslim.modelslim import (
+                ModelSlimConfig,
+            )
+
+            quant_config = self.model.quant_config
+            if isinstance(quant_config, ModelSlimConfig):
+                allocated_indexer_layers = (
+                    indexer_layer_ids
+                    if indexer_layer_ids is not None
+                    else tuple(
+                        range(
+                            self.layer_info.start_layer,
+                            self.layer_info.end_layer,
+                        )
+                    )
+                )
+                c8_indexer_layers = quant_config.get_c8_indexer_layers(
+                    allocated_indexer_layers
+                )
+                if c8_indexer_layers and c8_indexer_layers != allocated_indexer_layers:
+                    raise ValueError(
+                        "NPU DSA indexer pools require one storage dtype per pool; "
+                        "the ModelSlim config mixes C8 and BF16 indexer layers."
+                    )
+                if c8_indexer_layers:
+                    index_dtype = torch.float8_e4m3fn
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -2118,6 +2146,7 @@ class KVCacheConfigurator:
             index_size=index_size,
             index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
+            index_dtype=index_dtype,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype

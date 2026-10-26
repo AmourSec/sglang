@@ -204,6 +204,18 @@ class ModelSlimConfig(QuantizationConfig):
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
 
+    def get_c8_indexer_layers(self, layer_ids: tuple[int, ...]) -> tuple[int, ...]:
+        from sglang.srt.layers.quantization.modelslim.indexer_cache import (
+            get_modelslim_c8_indexer_layers,
+        )
+
+        quant_description = {
+            name: scheme
+            for name, scheme in self.quant_description.items()
+            if isinstance(name, str) and isinstance(scheme, str)
+        }
+        return get_modelslim_c8_indexer_layers(quant_description, layer_ids)
+
     def _quant_prefix_candidates(self, prefix: str) -> List[str]:
         """Return checkpoint-name variants without copying the large config.
 

@@ -22,6 +22,7 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
+    get_dsa_index_topk,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -30,7 +31,10 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    get_req_to_token_extra_context_len,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -130,6 +134,16 @@ def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[
     if len(layer_ids) != num_layers:
         return list(range(num_layers))
     return layer_ids
+
+
+def _get_dsa_indexer_layer_ids(
+    kvc: KVCacheConfigurator, num_layers: int
+) -> tuple[int, ...]:
+    return tuple(
+        layer_id
+        for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
+        if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+    )
 
 
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
@@ -251,6 +265,81 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
         self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        if envs.SGLANG_NPU_SPARSE_KV_SIMT.get():
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_sparse_kv_index_pool_budget,
+                get_sparse_kv_simt_capacity,
+                get_sparse_kv_simt_query_width,
+                get_sparse_kv_simt_resident_bytes,
+                validate_sparse_kv_simt_runtime,
+            )
+
+            validate_sparse_kv_simt_runtime(
+                kvc.server_args, kv_cache_dtype=kvc.kv_cache_dtype
+            )
+            max_running_requests = get_schedule().max_running_requests
+            if max_running_requests is None:
+                raise ValueError(
+                    "SGLANG_NPU_SPARSE_KV_SIMT requires max_running_requests."
+                )
+            capacity = get_sparse_kv_simt_capacity(
+                get_dsa_index_topk(kvc.model_config.hf_config)
+            )
+            draft_resident_layer_num = 0
+            if (
+                not kvc.is_draft_worker
+                and (
+                    kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
+                )
+                and kvc.spec_aux_config.eagle_draft_num_layers is not None
+                and int(kvc.spec_aux_config.eagle_draft_num_layers) > 0
+            ):
+                draft_resident_layer_num = int(
+                    kvc.spec_aux_config.eagle_draft_num_layers
+                )
+            resident_request_count = max(
+                1, max_running_requests // get_parallel().attn_dp_size
+            )
+            resident_query_width = get_sparse_kv_simt_query_width(kvc.server_args)
+            resident_topk = get_dsa_index_topk(kvc.model_config.hf_config)
+            resident_context_len = (
+                kvc.model_config.context_len + get_req_to_token_extra_context_len()
+            )
+            self._fixed_overhead_bytes += get_sparse_kv_simt_resident_bytes(
+                max_running_requests=resident_request_count,
+                query_width=resident_query_width,
+                capacity=capacity,
+                kv_lora_rank=kvc.model_config.kv_lora_rank,
+                qk_rope_head_dim=kvc.model_config.qk_rope_head_dim,
+                num_layers=num_layers,
+                topk=resident_topk,
+                max_context_len=resident_context_len,
+            )
+            if draft_resident_layer_num:
+                self._fixed_overhead_bytes += get_sparse_kv_simt_resident_bytes(
+                    max_running_requests=resident_request_count,
+                    query_width=resident_query_width,
+                    capacity=capacity,
+                    kv_lora_rank=kvc.model_config.kv_lora_rank,
+                    qk_rope_head_dim=kvc.model_config.qk_rope_head_dim,
+                    num_layers=draft_resident_layer_num,
+                    topk=resident_topk,
+                    max_context_len=resident_context_len,
+                )
+            target_indexer_layer_ids = _get_dsa_indexer_layer_ids(kvc, num_layers)
+            index_pool_budget = get_sparse_kv_index_pool_budget(
+                target_num_layers=len(target_indexer_layer_ids),
+                draft_num_layers=draft_resident_layer_num,
+                index_head_dim=get_dsa_index_head_dim(kvc.model_config.hf_config),
+                index_element_size=self._npu_indexer_element_size(
+                    kvc, target_indexer_layer_ids
+                ),
+                index_scale_element_size=self._npu_indexer_scale_element_size(
+                    kvc, target_indexer_layer_ids
+                ),
+                page_size=get_schedule().page_size,
+            )
+            self._fixed_overhead_bytes += index_pool_budget.padding_bytes
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -275,7 +364,30 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # host-expanded logical IDs.  Account for the entire dense
                     # address space that KVCacheConfigurator allocates below.
                     draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
-                if is_deepseek_dsa(kvc.model_config.hf_config):
+                if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+                    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                        get_sparse_kv_index_pool_budget,
+                    )
+
+                    target_indexer_layer_ids = _get_dsa_indexer_layer_ids(
+                        kvc, num_layers
+                    )
+                    index_pool_budget = get_sparse_kv_index_pool_budget(
+                        target_num_layers=len(target_indexer_layer_ids),
+                        draft_num_layers=draft_num_layers,
+                        index_head_dim=get_dsa_index_head_dim(
+                            kvc.model_config.hf_config
+                        ),
+                        index_element_size=self._npu_indexer_element_size(
+                            kvc, target_indexer_layer_ids
+                        ),
+                        index_scale_element_size=self._npu_indexer_scale_element_size(
+                            kvc, target_indexer_layer_ids
+                        ),
+                        page_size=get_schedule().page_size,
+                    )
+                    self._cell_size += index_pool_budget.draft_cell_bytes
+                elif is_deepseek_dsa(kvc.model_config.hf_config):
                     target_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=num_layers,
@@ -359,11 +471,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     get_sparsity_driven_kv_offload_cell_size,
                 )
 
+                indexer_layer_ids = _get_dsa_indexer_layer_ids(kvc, num_layers)
                 offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
                     model_config=model_config,
                     use_mla_backend=kvc.use_mla_backend,
-                    num_layers=num_layers,
+                    num_layers=len(indexer_layer_ids),
                     element_size=kv_size,
+                    index_element_size=self._npu_indexer_element_size(
+                        kvc, indexer_layer_ids
+                    ),
+                    index_scale_element_size=self._npu_indexer_scale_element_size(
+                        kvc, indexer_layer_ids
+                    ),
                 )
                 if offload_cell_size is not None:
                     return offload_cell_size
@@ -510,6 +629,36 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             hf_config=model_config.hf_config, num_layers=num_layers
         )
         return cell_size
+
+    @staticmethod
+    def _npu_indexer_element_size(
+        kvc: KVCacheConfigurator, layer_ids: tuple[int, ...]
+    ) -> int:
+        if not _is_npu:
+            return torch._utils._element_size(kvc.kv_cache_dtype)
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+        from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+
+        quant_config = kvc.model.quant_config
+        if (
+            layer_ids
+            and envs.SGLANG_NPU_SPARSE_KV_SIMT.get()
+            and is_npu_arch35()
+            and isinstance(quant_config, ModelSlimConfig)
+            and quant_config.get_c8_indexer_layers(layer_ids) == layer_ids
+        ):
+            return torch._utils._element_size(torch.float8_e4m3fn)
+        return torch._utils._element_size(kvc.kv_cache_dtype)
+
+    @classmethod
+    def _npu_indexer_scale_element_size(
+        cls, kvc: KVCacheConfigurator, layer_ids: tuple[int, ...]
+    ) -> int:
+        if cls._npu_indexer_element_size(kvc, layer_ids) == torch._utils._element_size(
+            torch.float8_e4m3fn
+        ):
+            return torch._utils._element_size(torch.float32)
+        return 0
 
     @staticmethod
     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:

@@ -1,0 +1,38 @@
+sgl-kernel-npu-sparse-kv
+
+The package-specific Python, Torch binding, adapter changes, build wrapper, and
+the Sparse KV operator host/config sources bearing SPDX-License-Identifier:
+Apache-2.0 are distributed under the Apache License 2.0 in LICENSE.
+
+The two files below are derived from MemFabric_Hybrid and retain their original
+Huawei copyright and Mulan PSL v2 notices. They are distributed under the Mulan
+Permissive Software License, Version 2 in THIRD_PARTY_LICENSES/MulanPSL-2.0.txt:
+
+  cann_ops/attention/sparse_kv_plan/op_kernel/sparse_kv_plan_apt.cpp
+  cann_ops/attention/sparse_kv_transfer/op_kernel/sparse_kv_transfer_apt.cpp
+
+The vendored CANN build-support files bearing a CANN Open Software License
+Agreement Version 2.0 notice are Huawei copyrighted material and are governed
+by that agreement, reproduced in
+THIRD_PARTY_LICENSES/CANN-Open-Software-License-Agreement-v2.0.txt. That
+agreement limits the material and its derivative works to systems using Huawei
+AI Processors and/or CANN software.
+
+The SparseKvPlan and SparseKvTransfer sources and their required CANN build
+support were derived from vllm-project/vllm-ascend commit
+cd84b83c566e62ac26934758cc563b152292f41e. Original file-level copyright,
+license, patent, trademark, and disclaimer notices are retained.
+
+The vendored patch
+`cann_ops/cmake/third_party/build/modules/patch/protobuf_25.1_change_version.patch`
+contains context derived from Protocol Buffers v25.1, Copyright 2008 Google
+Inc., and is governed by the BSD 3-Clause terms reproduced in
+THIRD_PARTY_LICENSES/Protobuf-BSD-3-Clause.txt.
+
+The vendored patch
+`cann_ops/cmake/third_party/build/modules/patch/protobuf-hide_absl_symbols.patch`
+contains context derived from Abseil 20230802.1, Copyright Google Inc., and is
+governed by the Apache License 2.0 reproduced in LICENSE.
+
+Copyright (c) Huawei Technologies Co., Ltd.
+Copyright (c) the vLLM team.

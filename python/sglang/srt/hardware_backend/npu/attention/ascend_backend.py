@@ -25,7 +25,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -364,18 +363,10 @@ class AscendAttnBackend(AttentionBackend):
         self.sparse_kv_manager = None
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
-                SparseKVCacheManager,
-                register_sparse_kv_manager,
+                get_or_create_sparse_kv_manager,
             )
 
-            self.sparse_kv_manager = SparseKVCacheManager(
-                model_runner.req_to_token_pool,
-                model_runner.token_to_kv_pool_allocator,
-                sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
-                    model_config=model_runner.model_config
-                ),
-            )
-            register_sparse_kv_manager(self.sparse_kv_manager)
+            self.sparse_kv_manager = get_or_create_sparse_kv_manager(model_runner)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",
                 self.sparse_kv_manager,

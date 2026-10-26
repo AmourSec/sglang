@@ -11,6 +11,11 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     _wait_stream_event,
     normalize_batch_topk_indices,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.metadata import (
+    pad_topk_rows,
+    should_use_sparse_kv_simt,
+    should_write_host_kv,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
 if TYPE_CHECKING:
@@ -61,10 +66,28 @@ def forward_sparsity_driven_kv_offload(
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
     sparse_kv_manager = _get_sparse_kv_manager(backend)
+    if sparse_kv_manager.uses_simt:
+        topk_indices = normalize_batch_topk_indices(topk_indices)
+        topk_indices = pad_topk_rows(topk_indices, q_nope.shape[0])
     stream = torch.npu.current_stream(backend.device)
 
-    if save_kv_cache:
+    if should_write_host_kv(save_kv_cache, sparse_kv_manager.uses_simt):
         sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
+
+    is_sparse_decode = should_use_sparse_kv_simt(forward_batch.forward_mode)
+    if sparse_kv_manager.uses_simt and is_sparse_decode:
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.simt_attention import (
+            forward_sparse_kv_simt,
+        )
+
+        return forward_sparse_kv_simt(
+            backend,
+            q_nope,
+            q_pe,
+            layer,
+            forward_batch,
+            topk_indices,
+        )
 
     if is_prefill:
         if backend.forward_metadata.actual_seq_lengths_q is not None:

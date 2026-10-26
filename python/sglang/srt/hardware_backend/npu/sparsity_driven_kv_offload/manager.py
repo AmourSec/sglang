@@ -48,6 +48,8 @@ def normalize_batch_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     """Normalize DSA top-k indices to [batch, topk] for compact KV copies."""
     if topk_indices.dim() == 2:
         return topk_indices
+    if topk_indices.dim() == 3 and topk_indices.shape[1] > 1:
+        return topk_indices.reshape(-1, topk_indices.shape[-1])
     if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
         return topk_indices[:, 0, :]
     if (
@@ -64,6 +66,7 @@ def normalize_batch_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
 
 
 class SparseKVCacheManager:
+    uses_simt = False
     copy_stream = None
     miss_shm_cpu_tensor: list = []
     miss_shm_dev_ptr: Optional[int] = None
@@ -247,25 +250,14 @@ class SparseKVCacheManager:
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
 
     def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
-        original_alloc = getattr(
-            req_to_token_pool, "_sparse_kv_original_alloc", req_to_token_pool.alloc
-        )
-        setattr(req_to_token_pool, "_sparse_kv_original_alloc", original_alloc)
+        original_hook = req_to_token_pool._on_alloc_rows
 
-        def alloc_with_sparse_reset(reqs: list[Req]) -> Optional[List[int]]:
-            newly_allocated = [req.req_pool_idx is None for req in reqs]
-            req_pool_indices = original_alloc(reqs)
-            if req_pool_indices is not None:
-                self.reset_requests(
-                    [
-                        req_pool_indices[i]
-                        for i, is_new in enumerate(newly_allocated)
-                        if is_new
-                    ]
-                )
-            return req_pool_indices
+        def reset_allocated_rows(indices: List[int]) -> None:
+            if original_hook is not None:
+                original_hook(indices)
+            self.reset_requests(indices)
 
-        setattr(req_to_token_pool, "alloc", alloc_with_sparse_reset)
+        req_to_token_pool._on_alloc_rows = reset_allocated_rows
 
     def offload(
         self,
@@ -861,6 +853,7 @@ class SparseKVCacheManager:
 
 
 _global_sparse_kv_manager: Optional[SparseKVCacheManager] = None
+_pool_sparse_kv_managers: dict[int, object] = {}
 
 
 def register_sparse_kv_manager(manager: SparseKVCacheManager) -> None:
@@ -870,6 +863,58 @@ def register_sparse_kv_manager(manager: SparseKVCacheManager) -> None:
 
 def get_sparse_kv_manager() -> Optional[SparseKVCacheManager]:
     return _global_sparse_kv_manager
+
+
+def get_or_create_sparse_kv_manager(model_runner):
+    from sglang.srt.configs.model_config import get_dsa_index_topk
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+        get_sparse_kv_simt_capacity,
+        get_sparse_kv_simt_query_width,
+        get_sparsity_driven_kv_offload_sparse_context_len,
+        is_sparse_kv_simt_enabled,
+        validate_sparse_kv_simt_runtime,
+    )
+
+    paged_kv_cache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+    pool_key = id(paged_kv_cache)
+    if pool_key in _pool_sparse_kv_managers:
+        return _pool_sparse_kv_managers[pool_key]
+    if is_sparse_kv_simt_enabled():
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.simt import (
+            SparseKVSimtManager,
+        )
+
+        if not isinstance(paged_kv_cache, MLATokenToKVPool):
+            raise TypeError("Sparse KV SIMT requires a direct MLA/DSA token KV pool")
+        validate_sparse_kv_simt_runtime(
+            model_runner.server_args, kv_cache_dtype=paged_kv_cache.store_dtype
+        )
+        index_topk = int(get_dsa_index_topk(model_runner.model_config.hf_config))
+        query_width = get_sparse_kv_simt_query_width(model_runner.server_args)
+        host_reserve_layer_num = paged_kv_cache.layer_num
+        if query_width == 4 and not model_runner.is_draft_worker:
+            host_reserve_layer_num += int(
+                model_runner.model_config.hf_config.num_nextn_predict_layers
+            )
+        manager = SparseKVSimtManager(
+            req_to_token_pool=model_runner.req_to_token_pool,
+            paged_kv_cache=paged_kv_cache,
+            capacity=get_sparse_kv_simt_capacity(index_topk),
+            topk=index_topk,
+            query_width=query_width,
+            host_reserve_layer_num=host_reserve_layer_num,
+        )
+    else:
+        manager = SparseKVCacheManager(
+            model_runner.req_to_token_pool,
+            model_runner.token_to_kv_pool_allocator,
+            sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
+                model_config=model_runner.model_config
+            ),
+        )
+    _pool_sparse_kv_managers[pool_key] = manager
+    register_sparse_kv_manager(manager)
+    return manager
 
 
 def _build_hit_src_dst_index(
