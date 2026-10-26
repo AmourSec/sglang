@@ -1,5 +1,9 @@
 # Ascend 950 Sparse KV operator tests
 
+The standalone Plan/Transfer performance matrix is documented in
+[`perf/README.md`](perf/README.md) and runs with
+`scripts/ascend/bench_sparse_kv_950.sh`.
+
 The CPU suite validates the independent scalar Plan oracle and paged Transfer oracle without an NPU:
 
 ```bash

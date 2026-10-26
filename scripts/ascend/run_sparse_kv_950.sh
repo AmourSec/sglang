@@ -71,6 +71,7 @@ if [[ "${MODE}" == "cpu" ]]; then
   "${PYTHON_BIN}" -m pytest -vv -rs \
     test/manual/ascend/sparse_kv/test_reference.py \
     test/manual/ascend/sparse_kv/test_plan_call_views.py \
+    test/manual/ascend/sparse_kv/test_perf_*.py \
     test/registered/unit/npu/test_sparse_kv_simt_config.py \
     test/registered/unit/npu/test_sparse_kv_simt_metadata.py \
     test/registered/unit/npu/test_modelslim_indexer_cache.py \
